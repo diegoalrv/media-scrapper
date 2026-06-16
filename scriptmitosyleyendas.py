@@ -21,9 +21,10 @@ import argparse
 import csv
 import json
 import os
+import re
 import sys
 import time
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -216,6 +217,57 @@ def parsear_carta(session, titulo):
     return carta
 
 
+def _nombre_archivo_seguro(texto):
+    """Convierte un nombre de carta en un nombre de archivo seguro."""
+    texto = texto.strip().replace(" ", "_")
+    texto = re.sub(r"[^\w.\-]", "", texto, flags=re.UNICODE)
+    return texto or "carta"
+
+
+def _url_imagen_full(url):
+    """Devuelve la URL a resolucion completa de una imagen de Fandom.
+
+    Las imagenes de Fandom suelen venir escaladas, p.ej.:
+      .../latest/scale-to-width-down/185?cb=2020...
+    Quitando el sufijo de escalado y el query string se obtiene la original.
+    """
+    url = url.split("?", 1)[0]
+    url = re.sub(r"/(scale-to-width-down|scale-to-width|window-crop)/.*$", "", url)
+    return url
+
+
+def descargar_imagen(session, url, directorio, nombre_base, max_reintentos=3):
+    """Descarga una imagen y devuelve la ruta local relativa, o None si falla."""
+    url = _url_imagen_full(url)
+
+    # Extension a partir de la ruta de la URL (fallback .png).
+    ext = os.path.splitext(urlparse(url).path)[1].lower()
+    if ext not in (".png", ".jpg", ".jpeg", ".gif", ".webp"):
+        ext = ".png"
+
+    os.makedirs(directorio, exist_ok=True)
+    ruta = os.path.join(directorio, _nombre_archivo_seguro(nombre_base) + ext)
+
+    # No volver a descargar si ya existe.
+    if os.path.exists(ruta):
+        return ruta
+
+    espera = 2
+    for intento in range(max_reintentos):
+        try:
+            resp = session.get(url, timeout=30)
+            resp.raise_for_status()
+            with open(ruta, "wb") as f:
+                f.write(resp.content)
+            return ruta
+        except requests.RequestException as e:
+            if intento == max_reintentos - 1:
+                print(f"    ! No se pudo descargar la imagen ({e})")
+                return None
+            time.sleep(espera)
+            espera *= 2
+
+
 def guardar_json(cartas, ruta):
     with open(ruta, "w", encoding="utf-8") as f:
         json.dump(cartas, f, ensure_ascii=False, indent=2)
@@ -279,10 +331,21 @@ def main():
         default="json,csv",
         help="Formatos de salida separados por coma: json,csv.",
     )
+    parser.add_argument(
+        "--download-images",
+        action="store_true",
+        help="Descargar la imagen de cada carta a <output-dir>/imagenes/.",
+    )
+    parser.add_argument(
+        "--images-dir",
+        default=None,
+        help="Directorio para las imagenes (por defecto <output-dir>/imagenes).",
+    )
     args = parser.parse_args()
 
     formatos = {f.strip().lower() for f in args.formats.split(",") if f.strip()}
     os.makedirs(args.output_dir, exist_ok=True)
+    images_dir = args.images_dir or os.path.join(args.output_dir, "imagenes")
 
     session = crear_sesion()
 
@@ -304,6 +367,12 @@ def main():
             continue
 
         if carta:
+            if args.download_images and carta.get("imagen"):
+                ruta_local = descargar_imagen(
+                    session, carta["imagen"], images_dir, carta["nombre"]
+                )
+                if ruta_local:
+                    carta["imagen_local"] = os.path.relpath(ruta_local, args.output_dir)
             cartas.append(carta)
             print(f"[{i}/{len(titulos)}] OK  {carta['nombre']}")
         else:
